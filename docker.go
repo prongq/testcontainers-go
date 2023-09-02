@@ -42,7 +42,8 @@ var (
 	// Implement interfaces
 	_ Container = (*DockerContainer)(nil)
 
-	ErrDuplicateMountTarget = errors.New("duplicate mount target detected")
+	ErrDuplicateMountTarget   = errors.New("duplicate mount target detected")
+	ErrContainerAlreadyExists = errors.New("container already exists")
 )
 
 const (
@@ -829,6 +830,22 @@ func (p *DockerProvider) BuildImage(ctx context.Context, img ImageBuildInfo) (st
 	return repoTag, nil
 }
 
+func waitContainerReadyWithLog(ctx context.Context, container *DockerContainer) error {
+	if container.WaitingFor == nil {
+		return nil
+	}
+
+	container.logger.Printf(
+		"🚧 Waiting for container id %s image: %s. Waiting for: %+v",
+		container.ID[:12], container.Image, container.WaitingFor,
+	)
+	if err := container.WaitingFor.WaitUntilReady(ctx, container); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // CreateContainer fulfills a request for a container without starting it
 func (p *DockerProvider) CreateContainer(ctx context.Context, req ContainerRequest) (Container, error) {
 	var err error
@@ -1021,14 +1038,8 @@ func (p *DockerProvider) CreateContainer(ctx context.Context, req ContainerReque
 					dockerContainer := c.(*DockerContainer)
 
 					// if a Wait Strategy has been specified, wait before returning
-					if dockerContainer.WaitingFor != nil {
-						dockerContainer.logger.Printf(
-							"🚧 Waiting for container id %s image: %s. Waiting for: %+v",
-							dockerContainer.ID[:12], dockerContainer.Image, dockerContainer.WaitingFor,
-						)
-						if err := dockerContainer.WaitingFor.WaitUntilReady(ctx, c); err != nil {
-							return err
-						}
+					if err := waitContainerReadyWithLog(ctx, dockerContainer); err != nil {
+						return err
 					}
 
 					dockerContainer.isRunning = true
@@ -1048,7 +1059,10 @@ func (p *DockerProvider) CreateContainer(ctx context.Context, req ContainerReque
 	}
 
 	resp, err := p.client.ContainerCreate(ctx, dockerInput, hostConfig, networkingConfig, platform, req.Name)
-	if err != nil {
+	switch {
+	case errdefs.IsConflict(err):
+		return nil, fmt.Errorf("%w: %w", ErrContainerAlreadyExists, err)
+	case err != nil:
 		return nil, err
 	}
 
@@ -1113,13 +1127,41 @@ func (p *DockerProvider) findContainerByName(ctx context.Context, name string) (
 	return nil, nil
 }
 
+func (p *DockerProvider) waitContainerCreation(ctx context.Context, name string) (*types.Container, error) {
+	var container *types.Container
+	return container, backoff.Retry(func() error {
+		c, err := p.findContainerByName(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		if c == nil {
+			return fmt.Errorf("container %s not found", name)
+		}
+
+		container = c
+		return nil
+	}, backoff.WithContext(backoff.NewExponentialBackOff(), ctx))
+}
+
 func (p *DockerProvider) ReuseOrCreateContainer(ctx context.Context, req ContainerRequest) (Container, error) {
 	c, err := p.findContainerByName(ctx, req.Name)
 	if err != nil {
 		return nil, err
 	}
 	if c == nil {
-		return p.CreateContainer(ctx, req)
+		createdContainer, err := p.CreateContainer(ctx, req)
+		switch {
+		case errors.Is(err, ErrContainerAlreadyExists):
+			c, err = p.waitContainerCreation(ctx, req.Name)
+			if err != nil {
+				return nil, err
+			}
+		case err != nil:
+			return nil, err
+		default:
+			return createdContainer, nil
+		}
 	}
 
 	tcConfig := p.Config().Config
@@ -1145,8 +1187,13 @@ func (p *DockerProvider) ReuseOrCreateContainer(ctx context.Context, req Contain
 		terminationSignal: termSignal,
 		stopProducer:      nil,
 		logger:            p.Logger,
-		isRunning:         c.State == "running",
 	}
+
+	if err := waitContainerReadyWithLog(ctx, dc); err != nil {
+		return nil, err
+	}
+
+	dc.isRunning = true
 
 	return dc, nil
 }
